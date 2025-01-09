@@ -189,7 +189,7 @@ class BrowsePage extends StatefulWidget {
 class BrowsePageState extends State<BrowsePage> {
   String? currentPath;
   int? parentFolderID;
-  int? currentFolderID;
+  int currentFolderID = 1;
   List<Folder>? folders;
   List<File>? files;
   bool _loading = true;
@@ -197,10 +197,10 @@ class BrowsePageState extends State<BrowsePage> {
   @override
   void initState() {
     super.initState();
-    _fetchData();
+    _fetchData(currentFolderID);
   }
 
-  Future<void> _fetchData() async {
+  Future<void> _fetchData(int folderID) async {
     setState(() {
       _loading = true;
     });
@@ -209,7 +209,7 @@ class BrowsePageState extends State<BrowsePage> {
     try {
       // 构建请求体
       Map<String, dynamic> requestBody = {
-        'folderID': 1,
+        'folderID': folderID,
       };
 
       // 发送 POST 请求
@@ -223,8 +223,11 @@ class BrowsePageState extends State<BrowsePage> {
 
       if (response.statusCode == 200) {
         // 成功处理响应数据
-        final jsonResponse = json.decode(response.body);
+        final jsonResponse = json.decode(utf8.decode(response.bodyBytes));
         final data = QueryFolderData.fromJson(jsonResponse);
+
+        data.folders.sort((a, b) => a.name.compareTo(b.name));
+        data.files.sort((a, b) => a.name.compareTo(b.name));
 
         setState(() {
           currentPath = data.self.path;
@@ -247,19 +250,26 @@ class BrowsePageState extends State<BrowsePage> {
     }
   }
 
+  void onFolderTap(int folderID) {
+    _fetchData(folderID);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Folder and File List'),
       ),
-      body: _loading
+      body: RefreshIndicator(
+        onRefresh: () async {
+          await _fetchData(currentFolderID);
+        },
+        child: _loading
           ? const Center(child: CircularProgressIndicator())
           : Column(
         children: [
           ListTile(
             title: Text('Current Path: $currentPath'),
-            subtitle: Text('Parent Folder ID: $parentFolderID'),
           ),
           Expanded(
             child: ListView.builder(
@@ -268,13 +278,15 @@ class BrowsePageState extends State<BrowsePage> {
                 if (index < (folders?.length ?? 0)) {
                   final folder = folders![index];
                   return ListTile(
+                    leading: const Icon(Icons.folder),
                     title: Text(folder.name),
-                    subtitle: Text(folder.path),
+                    onTap:() => onFolderTap(folder.id)
                   );
                 } else {
                   final fileIndex = index - (folders?.length ?? 0);
                   final file = files![fileIndex];
                   return ListTile(
+                    leading: const Icon(Icons.insert_drive_file),
                     title: Text(file.name),
                     subtitle: Text('${file.size} bytes'),
                   );
@@ -284,6 +296,7 @@ class BrowsePageState extends State<BrowsePage> {
           ),
         ],
       ),
+    )
     );
   }
 }
