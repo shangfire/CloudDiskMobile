@@ -3,6 +3,8 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_slidable/flutter_slidable.dart';
 
 class QueryFolderData {
   final Self self;
@@ -80,6 +82,24 @@ class Folder {
       updatedAt: DateTime.parse(json['updatedAt']),
     );
   }
+
+  Folder copyWith({
+    int? id,
+    int? parentFolderId,
+    String? name,
+    String? path,
+    DateTime? createdAt,
+    DateTime? updatedAt,
+  }) {
+    return Folder(
+      id: id ?? this.id,
+      parentFolderId: parentFolderId ?? this.parentFolderId,
+      name: name ?? this.name,
+      path: path ?? this.path,
+      createdAt: createdAt ?? this.createdAt,
+      updatedAt: updatedAt ?? this.updatedAt,
+    );
+  }
 }
 
 class File {
@@ -113,6 +133,28 @@ class File {
       size: json['size'],
       createdAt: DateTime.parse(json['createdAt']),
       updatedAt: DateTime.parse(json['updatedAt']),
+    );
+  }
+
+  File copyWith({
+    int? id,
+    int? parentFolderId,
+    String? name,
+    int? fileType,
+    String? path,
+    int? size,
+    DateTime? createdAt,
+    DateTime? updatedAt,
+  }) {
+    return File(
+      id: id ?? this.id,
+      parentFolderId: parentFolderId ?? this.parentFolderId,
+      name: name ?? this.name,
+      fileType: fileType ?? this.fileType,
+      path: path ?? this.path,
+      size: size ?? this.size,
+      createdAt: createdAt ?? this.createdAt,
+      updatedAt: updatedAt ?? this.updatedAt,
     );
   }
 }
@@ -175,6 +217,23 @@ class MainPageState extends State<MainPage> {
         selectedItemColor: Colors.blue,
         onTap: _onItemTapped,
       ),
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: <Widget>[
+          FloatingActionButton(
+            onPressed: () => showCreateFolderDialog(context, currentParentFolderId),
+            tooltip: 'Add Folder',
+            child: const Icon(Icons.create_new_folder),
+          ),
+          const SizedBox(height: 10), // 添加一些间距
+          FloatingActionButton(
+            onPressed: () => {},
+            tooltip: 'Upload File',
+            child: const Icon(Icons.file_upload),
+          ),
+        ],
+      ),
+      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
     );
   }
 }
@@ -250,6 +309,161 @@ class BrowsePageState extends State<BrowsePage> {
     }
   }
 
+  Future<void> showRenameDialog(BuildContext context, String name, int id, bool isFolder) {
+    final TextEditingController textController = TextEditingController(text: name);
+
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false, // 用户点击背景时不会关闭对话框
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Rename'),
+          content: TextField(
+            controller: textController,
+            decoration: const InputDecoration(hintText: "Enter new name"),
+          ),
+          actions: <Widget>[
+            TextButton(
+              child: const Text('Cancel'),
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+            ),
+            TextButton(
+              child: const Text('Rename'),
+              onPressed: () async {
+                if (textController.text.isNotEmpty) {
+                  await renameItem(context, textController.text, id, isFolder);
+                  Navigator.of(context).pop(); // 关闭对话框
+                }
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> renameItem(BuildContext context, String newName, int id, bool isFolder) async {
+    try {
+      final url = isFolder
+          ? Uri.parse('http://182.92.66.72:8080/api/renameFolder')
+          : Uri.parse('http://182.92.66.72:8080/api/renameFile');
+
+      final body = isFolder ? {'folderName': newName, 'folderID': id} : {'fileName': newName, 'fileID': id};
+
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(body),
+      );
+
+      if (response.statusCode == 200) {
+        if (isFolder) {
+          final folderIndex = folders?.indexWhere((folder) => folder.id == id);
+          if (folderIndex != null && folderIndex >= 0) {
+            setState(() {
+              folders![folderIndex] = folders![folderIndex].copyWith(name: newName);
+            });
+          }
+        } else {
+          final fileIndex = files?.indexWhere((file) => file.id == id);
+          if (fileIndex != null && fileIndex >= 0) {
+            setState(() {
+              files![fileIndex] = files![fileIndex].copyWith(name: newName);
+            });
+          }
+        }
+
+        // 成功处理后的逻辑，例如刷新列表
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Renamed successfully!')),
+        );
+        // 更新UI代码...
+      } else {
+        // 错误处理
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to rename. Please try again.')),
+        );
+      }
+    } catch (e) {
+      // 网络错误或其他异常处理
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('An error occurred. Please check your connection and try again.')),
+      );
+    }
+  }
+
+
+  Future<void> showDeleteConfirmationDialog(BuildContext context, int id, bool isFolder) async {
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false, // 用户点击背景时不会关闭对话框
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text('Confirm Delete'),
+          content: Text(isFolder ? 'Are you sure you want to delete this folder?' : 'Are you sure you want to delete this file?'),
+          actions: <Widget>[
+            TextButton(
+              child: Text('Cancel'),
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+            ),
+            TextButton(
+              child: Text('Delete'),
+              onPressed: () async {
+                await deleteItem(context, id, isFolder);
+                Navigator.of(context).pop(); // 关闭对话框
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> deleteItem(BuildContext context, int id, bool isFolder) async {
+    try {
+      final url = isFolder
+          ? Uri.parse('http://182.92.66.72:8080/api/deleteFolder')
+          : Uri.parse('http://182.92.66.72:8080/api/deleteFile');
+
+      final body = isFolder ? {'folderID': id} : {'fileID': id};
+
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(body),
+      );
+
+      if (response.statusCode == 200) { // 通常204表示成功但没有内容返回
+        // 更新本地数据模型
+        if (isFolder) {
+          setState(() {
+            folders?.removeWhere((folder) => folder.id == id);
+          });
+        } else {
+          setState(() {
+            files?.removeWhere((file) => file.id == id);
+          });
+        }
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Deleted successfully!')),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to delete. Please try again.')),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('An error occurred. Please check your connection and try again.')),
+      );
+    }
+  }
+
   void onFolderTap(int folderID) {
     _fetchData(folderID);
   }
@@ -275,22 +489,37 @@ class BrowsePageState extends State<BrowsePage> {
             child: ListView.builder(
               itemCount: (folders?.length ?? 0) + (files?.length ?? 0),
               itemBuilder: (context, index) {
-                if (index < (folders?.length ?? 0)) {
-                  final folder = folders![index];
-                  return ListTile(
-                    leading: const Icon(Icons.folder),
-                    title: Text(folder.name),
-                    onTap:() => onFolderTap(folder.id)
-                  );
-                } else {
-                  final fileIndex = index - (folders?.length ?? 0);
-                  final file = files![fileIndex];
-                  return ListTile(
-                    leading: const Icon(Icons.insert_drive_file),
-                    title: Text(file.name),
-                    subtitle: Text('${file.size} bytes'),
-                  );
-                }
+                final isFolder = index < (folders?.length ?? 0);
+                final item = isFolder ? folders![index] : files![index - (folders?.length ?? 0)];
+
+                return Slidable(
+                  key: ValueKey(item is Folder ? item.id : (item as File).id),
+                  endActionPane: ActionPane(
+                    motion: const ScrollMotion(),
+                    children: [
+                      SlidableAction(
+                        onPressed: (context) => showRenameDialog(context, item is Folder ? item.name : (item as File).name, item is Folder ? item.id : (item as File).id, isFolder),
+                        backgroundColor: Colors.blue,
+                        foregroundColor: Colors.white,
+                        icon: Icons.edit,
+                        label: 'Rename',
+                      ),
+                      SlidableAction(
+                        onPressed: (context) => showDeleteConfirmationDialog(context, item is Folder ? item.id : (item as File).id, isFolder),
+                        backgroundColor: Colors.red,
+                        foregroundColor: Colors.white,
+                        icon: Icons.delete,
+                        label: 'Delete',
+                        ),
+                    ],
+                  ),
+                  child: ListTile(
+                    leading: isFolder ? const Icon(Icons.folder) : const Icon(Icons.insert_drive_file),
+                    title: Text(item is Folder ? item.name : (item as File).name),
+                    subtitle: isFolder ? null : Text('${(item as File).size} bytes'),
+                    onTap: isFolder ? () => onFolderTap((item as Folder).id) : null,
+                  ),
+                );
               },
             ),
           ),
