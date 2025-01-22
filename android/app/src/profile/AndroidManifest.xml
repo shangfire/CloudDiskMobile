@@ -3,5 +3,29 @@
          the Flutter tool needs it to communicate with the running application
          to allow setting breakpoints, to provide hot reload, etc.
     -->
+    <!-- 应用图标和其他属性 -->
+    <application>
+        <!-- 配置 FlutterDownloader 的服务 -->
+        <service
+            android:name="com.mirza.adnan downloader.DownloadService"
+            android:permission="android.permission.BIND_DOWNLOAD_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="flutter_downloader.DOWNLOAD_SERVICE" />
+            </intent-filter>
+        </service>
+
+        <!-- 下载完成通知渠道 (适用于 Android 8.0 及以上) -->
+        <meta-data
+            android:name="flutter_downloader_notification_channel_name"
+            android:value="Download channel" />
+
+        <!-- 指定下载任务的最大数量 -->
+        <meta-data
+            android:name="flutter_downloader_max_concurrent_tasks"
+            android:value="5" />
+    </application>
+
     <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 </manifest>

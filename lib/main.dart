@@ -5,6 +5,10 @@ import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
+import 'package:mime/mime.dart';
+import 'package:http_parser/http_parser.dart';
+import 'package:flutter_downloader/flutter_downloader.dart';
+import 'package:path_provider/path_provider.dart';
 
 class QueryFolderData {
   final Self self;
@@ -159,7 +163,11 @@ class File {
   }
 }
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await FlutterDownloader.initialize(
+      debug: true // 开启调试模式
+  );
   runApp(const MyApp());
 }
 
@@ -186,54 +194,10 @@ class MainPage extends StatefulWidget {
 }
 
 class MainPageState extends State<MainPage> {
-  int _selectedIndex = 0;
-  static final List<Widget> _pages = <Widget>[
-    const BrowsePage(),
-    const UploadPage(),
-  ];
-
-  void _onItemTapped(int index) {
-    setState(() {
-      _selectedIndex = index;
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: _pages[_selectedIndex],
-      bottomNavigationBar: BottomNavigationBar(
-        items: const <BottomNavigationBarItem>[
-          BottomNavigationBarItem(
-            icon: Icon(Icons.home),
-            label: 'Browse',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.upload),
-            label: 'Upload',
-          ),
-        ],
-        currentIndex: _selectedIndex,
-        selectedItemColor: Colors.blue,
-        onTap: _onItemTapped,
-      ),
-      floatingActionButton: Column(
-        mainAxisAlignment: MainAxisAlignment.end,
-        children: <Widget>[
-          FloatingActionButton(
-            onPressed: () => showCreateFolderDialog(context, currentParentFolderId),
-            tooltip: 'Add Folder',
-            child: const Icon(Icons.create_new_folder),
-          ),
-          const SizedBox(height: 10), // 添加一些间距
-          FloatingActionButton(
-            onPressed: () => {},
-            tooltip: 'Upload File',
-            child: const Icon(Icons.file_upload),
-          ),
-        ],
-      ),
-      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
+      body: const BrowsePage(),
     );
   }
 }
@@ -247,7 +211,7 @@ class BrowsePage extends StatefulWidget {
 
 class BrowsePageState extends State<BrowsePage> {
   String? currentPath;
-  int? parentFolderID;
+  int parentFolderID = 0;
   int currentFolderID = 1;
   List<Folder>? folders;
   List<File>? files;
@@ -464,15 +428,237 @@ class BrowsePageState extends State<BrowsePage> {
     }
   }
 
-  void onFolderTap(int folderID) {
-    _fetchData(folderID);
+  void showCreateFolderDialog(BuildContext context, int parentFolderID) {
+    final TextEditingController _controller = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Create New Folder'),
+          content: TextField(
+            controller: _controller,
+            decoration: const InputDecoration(hintText: 'Enter folder name'),
+          ),
+          actions: <Widget>[
+            TextButton(
+              child: const Text('Cancel'),
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+            ),
+            TextButton(
+              child: const Text('Create'),
+              onPressed: () async {
+                final String folderName = _controller.text.trim();
+                if (folderName.isNotEmpty) {
+                  final newFolder = await createFolder(folderName, parentFolderID);
+                  if (newFolder != null) {
+                    setState(() {
+                      folders?.add(newFolder);
+                      folders?.sort((a, b) => a.name.compareTo(b.name));
+                    });
+                  }
+
+                  Navigator.of(context).pop(); // 关闭对话框
+                } else {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Folder name cannot be empty')),
+                  );
+                }
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<Folder?> createFolder(String folderName, int parentFolderID) async {
+    final url = Uri.parse('http://182.92.66.72:8080/api/createFolder');
+    final response = await http.post(
+      url,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        "folderName": folderName,
+        "parentFolderID": parentFolderID,
+      }),
+    );
+
+    if (response.statusCode == 200) {
+      // 请求成功，可以刷新数据或显示成功消息
+      print('Folder created successfully');
+      final responseData = jsonDecode(response.body);
+      final newFolder = Folder.fromJson(responseData);
+      print('Folder created successfully: ${newFolder.name}');
+      return newFolder;
+    } else {
+      // 请求失败，打印错误信息
+      print('Failed to create folder: ${response.statusCode}');
+    }
+  }
+
+  void showUploadFileDialog(BuildContext context) async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles();
+
+    if (result != null) {
+      PlatformFile file = result.files.first;
+      final response = await uploadFile(file, currentFolderID);
+
+      if (response != null) {
+        // 更新本地状态和UI
+        setState(() {
+          files?.add(response);
+          // 对列表进行排序，这里以文件名称为例
+          files?.sort((a, b) => a.name.compareTo(b.name));
+        });
+      }
+    } else {
+      // 用户取消了文件选择
+    }
+  }
+
+  Future<File?> uploadFile(PlatformFile file, int parentFolderID) async {
+    try {
+      var request = http.MultipartRequest(
+        'POST',
+        Uri.parse('http://182.92.66.72:8080/api/uploadFile'),
+      );
+
+      // 添加文件到请求中
+      request.files.add(await http.MultipartFile.fromPath(
+        'file', // 这是服务器端期待的字段名
+        file.path!,
+        contentType: MediaType.parse(lookupMimeType(file.path!) ?? 'application/octet-stream'),
+      ));
+
+      // 添加其他表单字段
+      request.fields['parentFolderID'] = parentFolderID.toString();
+      request.fields['fileSize'] = file.size.toString();
+
+      var streamedResponse = await request.send();
+      var response = await http.Response.fromStream(streamedResponse);
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body);
+        final uploadedFile = File.fromJson(responseData);
+        print('File uploaded successfully: ${uploadedFile.name}');
+        return uploadedFile;
+      } else {
+        print('Failed to upload file: ${response.statusCode}');
+        // throw Exception('Failed to upload file');
+      }
+    } catch (e) {
+      print('Error during file upload: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to upload file: $e')),
+      );
+      return null;
+    }
+  }
+
+  Future<void> downloadFile(int fileID) async {
+    // 发送下载请求
+    final response = await http.post(
+      Uri.parse('http://182.92.66.72:8080/api/downloadFile'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({"fileID": fileID}),
+    );
+
+    if (response.statusCode == 200) {
+      final downloadUrl = jsonDecode(response.body)['downloadUrl'];
+
+      // 获取保存路径
+      final directory = await getExternalStorageDirectory();
+      if (directory == null) {
+        throw Exception("Failed to get external storage directory.");
+      }
+
+      // 构建下载任务
+      final taskId = await FlutterDownloader.enqueue(
+        url: downloadUrl,
+        savedDir: directory.path,
+        fileName: "file_$fileID", // 可以根据实际情况调整文件名
+        showNotification: true, // 显示下载进度通知
+        openFileFromNotification: true, // 下载完成后打开文件
+      );
+
+      print('Download task created with ID: $taskId');
+    } else {
+      throw Exception('Failed to initiate download: ${response.statusCode}');
+    }
+  }
+
+  void showDownloadConfirmationDialog(BuildContext context, int fileID) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Download File'),
+          content: const Text('Do you want to download this file?'),
+          actions: <Widget>[
+            TextButton(
+              child: const Text('Cancel'),
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+            ),
+            TextButton(
+              child: const Text('Download'),
+              onPressed: () async {
+                try {
+                  await downloadFile(fileID);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Download started.')),
+                  );
+                } catch (e) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Failed to start download: $e')),
+                  );
+                }
+                Navigator.of(context).pop();
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void onTap(BuildContext context, int id, bool isFolder) {
+    if (isFolder) {
+      _fetchData(id);
+    }
+    else {
+      showDownloadConfirmationDialog(context, id);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Folder and File List'),
+        title: Row(
+          children: [
+            // 返回上一层按钮，条件渲染
+            if (parentFolderID != 0)
+              IconButton(
+                icon: Icon(Icons.arrow_back),
+                onPressed: () async {
+                  // 处理返回上一层逻辑
+                  await _fetchData(parentFolderID);
+                },
+              ),
+            // 显示当前路径
+            Expanded(
+              child: Text(
+                'Current Path: $currentPath',
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 20),
+              ),
+            ),
+          ],
+        ),
       ),
       body: RefreshIndicator(
         onRefresh: () async {
@@ -482,9 +668,6 @@ class BrowsePageState extends State<BrowsePage> {
           ? const Center(child: CircularProgressIndicator())
           : Column(
         children: [
-          ListTile(
-            title: Text('Current Path: $currentPath'),
-          ),
           Expanded(
             child: ListView.builder(
               itemCount: (folders?.length ?? 0) + (files?.length ?? 0),
@@ -517,7 +700,7 @@ class BrowsePageState extends State<BrowsePage> {
                     leading: isFolder ? const Icon(Icons.folder) : const Icon(Icons.insert_drive_file),
                     title: Text(item is Folder ? item.name : (item as File).name),
                     subtitle: isFolder ? null : Text('${(item as File).size} bytes'),
-                    onTap: isFolder ? () => onFolderTap((item as Folder).id) : null,
+                    onTap: () => onTap(context, item is Folder ? (item as Folder).id : (item as File).id, isFolder),
                   ),
                 );
               },
@@ -525,123 +708,24 @@ class BrowsePageState extends State<BrowsePage> {
           ),
         ],
       ),
-    )
-    );
-  }
-}
-
-class UploadPage extends StatefulWidget {
-  const UploadPage({super.key});
-
-  @override
-  UploadPageState createState() => UploadPageState();
-}
-
-class UploadPageState extends State<UploadPage> {
-  final _formKey = GlobalKey<FormState>();
-  String? _title;
-  String? _content;
-  List<PlatformFile>? _files;
-
-  Future<void> _uploadData() async {
-    if (_formKey.currentState!.validate()) {
-      _formKey.currentState!.save();
-
-      var request = http.MultipartRequest('POST', Uri.parse('http://47.93.220.11:8080/upload'));
-
-      // 添加表单字段
-      request.fields['title'] = _title!;
-      request.fields['content'] = _content!;
-
-      // 添加文件
-      if (_files != null) {
-        for (var file in _files!) {
-          request.files.add(await http.MultipartFile.fromPath('files[]', file.path!));
-        }
-      }
-
-      // 发送请求
-      var response = await request.send();
-
-      if (response.statusCode == 200) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('上传成功！')));
-        }
-      } else {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('上传失败！')));
-        }
-      }
-    }
-  }
-
-  Future<void> _pickFiles() async {
-    // 请求权限
-    var status = await Permission.storage.request();
-    if (status.isGranted) {
-      // 权限被授予后，选择文件
-      _files = (await FilePicker.platform.pickFiles(allowMultiple: true))?.files;
-      setState(() {});
-    } else {
-      // 权限未被授予
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请允许访问文件')));
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Upload Page'),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Form(
-          key: _formKey,
-          child: Column(
-            children: [
-              TextFormField(
-                decoration: const InputDecoration(labelText: 'Title'),
-                validator: (value) {
-                  if (value!.isEmpty) {
-                    return '请输入标题';
-                  }
-                  return null;
-                },
-                onSaved: (value) {
-                  _title = value;
-                },
-              ),
-              TextFormField(
-                decoration: const InputDecoration(labelText: 'Content'),
-                validator: (value) {
-                  if (value!.isEmpty) {
-                    return '请输入内容';
-                  }
-                  return null;
-                },
-                onSaved: (value) {
-                  _content = value;
-                },
-              ),
-              const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: _pickFiles,
-                child: const Text('选择文件'),
-              ),
-              if (_files != null)
-                ..._files!.map((file) => Text(file.name)),
-              const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: _uploadData,
-                child: const Text('上传'),
-              ),
-            ],
+    ),
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: <Widget>[
+          FloatingActionButton(
+            onPressed: () => showCreateFolderDialog(context, currentFolderID),
+            tooltip: 'Add Folder',
+            child: const Icon(Icons.create_new_folder),
           ),
-        ),
+          const SizedBox(height: 10), // 添加一些间距
+          FloatingActionButton(
+            onPressed: () => showUploadFileDialog(context),
+            tooltip: 'Upload File',
+            child: const Icon(Icons.file_upload),
+          ),
+        ],
       ),
+      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
     );
   }
 }
