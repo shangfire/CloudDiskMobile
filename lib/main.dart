@@ -1,15 +1,30 @@
+// 依赖说明：
+// http              - 发送 HTTP 请求（GET/POST/multipart）
+// file_picker       - 调起系统文件选择器，获取本地文件路径
+// flutter_slidable  - 列表项左滑/右滑操作面板
+// mime / http_parser - 根据文件扩展名推断 MIME 类型，用于上传时设置 Content-Type
+// path_provider     - 获取设备存储路径（外部存储目录）
+import 'dart:convert';
+import 'dart:io' as io;
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:mime/mime.dart';
 import 'package:http_parser/http_parser.dart';
-import 'package:flutter_downloader/flutter_downloader.dart';
 import 'package:path_provider/path_provider.dart';
 
+// ─────────────────────────────────────────────
+// 数据模型：对应后端 /api/queryFolder 的响应结构
+// {
+//   "self":    { 当前文件夹信息 },
+//   "folders": [ 子文件夹列表 ],
+//   "files":   [ 当前文件夹下的文件列表 ]
+// }
+// ─────────────────────────────────────────────
+
+/// 查询文件夹接口的完整响应
 class QueryFolderData {
   final Self self;
   final List<Folder> folders;
@@ -30,11 +45,12 @@ class QueryFolderData {
   }
 }
 
+/// 当前文件夹自身的信息（用于获取路径、父级 ID 等导航数据）
 class Self {
   final int id;
-  final int parentFolderId;
+  final int parentFolderId; // 父文件夹 ID，根目录时为 0
   final String name;
-  final String path;
+  final String path;        // 完整路径字符串，显示在 AppBar
   final DateTime createdAt;
   final DateTime updatedAt;
 
@@ -59,6 +75,7 @@ class Self {
   }
 }
 
+/// 文件夹数据模型
 class Folder {
   final int id;
   final int parentFolderId;
@@ -87,6 +104,7 @@ class Folder {
     );
   }
 
+  // 用于重命名后在本地更新列表，避免重新请求整个列表
   Folder copyWith({
     int? id,
     int? parentFolderId,
@@ -106,13 +124,14 @@ class Folder {
   }
 }
 
+/// 文件数据模型
 class File {
   final int id;
   final int parentFolderId;
   final String name;
   final int fileType;
   final String path;
-  final int size;
+  final int size;     // 文件大小，单位：字节
   final DateTime createdAt;
   final DateTime updatedAt;
 
@@ -140,6 +159,7 @@ class File {
     );
   }
 
+  // 用于重命名后在本地更新列表，避免重新请求整个列表
   File copyWith({
     int? id,
     int? parentFolderId,
@@ -163,11 +183,11 @@ class File {
   }
 }
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await FlutterDownloader.initialize(
-      debug: true // 开启调试模式
-  );
+// ─────────────────────────────────────────────
+// 应用入口 & 顶层 Widget
+// ─────────────────────────────────────────────
+
+void main() {
   runApp(const MyApp());
 }
 
@@ -177,7 +197,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'Cloud Disk',
       theme: ThemeData(
         primarySwatch: Colors.blue,
       ),
@@ -186,6 +206,7 @@ class MyApp extends StatelessWidget {
   }
 }
 
+/// 主页面，目前只是 BrowsePage 的壳，后续可在此添加底部导航栏等
 class MainPage extends StatefulWidget {
   const MainPage({super.key});
 
@@ -196,12 +217,17 @@ class MainPage extends StatefulWidget {
 class MainPageState extends State<MainPage> {
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: const BrowsePage(),
+    return const Scaffold(
+      body: BrowsePage(),
     );
   }
 }
 
+// ─────────────────────────────────────────────
+// 核心页面：文件/文件夹浏览
+// ─────────────────────────────────────────────
+
+/// 文件浏览页面（有状态），负责展示当前目录内容并处理所有用户操作
 class BrowsePage extends StatefulWidget {
   const BrowsePage({super.key});
 
@@ -211,11 +237,17 @@ class BrowsePage extends StatefulWidget {
 
 class BrowsePageState extends State<BrowsePage> {
   String? currentPath;
-  int parentFolderID = 0;
-  int currentFolderID = 1;
+  int parentFolderID = 0;   // 父目录 ID；为 0 表示已在根目录，隐藏返回按钮
+  int currentFolderID = 1;  // 当前目录 ID；初始值 1 表示根目录
   List<Folder>? folders;
   List<File>? files;
   bool _loading = true;
+  bool _uploading = false;      // 上传进行中
+  String _uploadingName = '';   // 正在上传的文件名
+  bool _downloading = false;    // 下载进行中（文件或文件夹）
+  String _downloadingName = ''; // 正在下载的文件/文件夹名称
+
+  static const String _baseUrl = 'http://182.92.66.72:8080';
 
   @override
   void initState() {
@@ -223,82 +255,88 @@ class BrowsePageState extends State<BrowsePage> {
     _fetchData(currentFolderID);
   }
 
+  // ── 工具函数 ──────────────────────────────
+
+  /// 格式化文件大小，自动选择合适的单位
+  String _formatFileSize(int size) {
+    if (size == 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    final i = (math.log(size) / math.log(1024)).floor();
+    return '${(size / math.pow(1024, i)).toStringAsFixed(2)} ${units[i]}';
+  }
+
+  /// 获取下载保存目录
+  /// Android：app 专属外部存储（无需额外权限），iOS：Documents 目录
+  Future<io.Directory> _getDownloadDirectory() async {
+    if (io.Platform.isAndroid) {
+      final dir = await getExternalStorageDirectory();
+      if (dir != null) return dir;
+    }
+    return getApplicationDocumentsDirectory();
+  }
+
+  // ── 网络请求 ──────────────────────────────
+
+  /// 请求指定文件夹的内容，成功后更新状态刷新 UI
   Future<void> _fetchData(int folderID) async {
-    setState(() {
-      _loading = true;
-    });
-    final url = Uri.parse('http://182.92.66.72:8080/api/queryFolder');
-
+    setState(() { _loading = true; });
     try {
-      // 构建请求体
-      Map<String, dynamic> requestBody = {
-        'folderID': folderID,
-      };
-
-      // 发送 POST 请求
       final response = await http.post(
-        url,
-        headers: {
-          'Content-Type': 'application/json', // 设置请求头
-        },
-        body: jsonEncode(requestBody), // 将请求体编码为 JSON 字符串
+        Uri.parse('$_baseUrl/api/queryFolder'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'folderID': folderID}),
       );
-
       if (response.statusCode == 200) {
-        // 成功处理响应数据
         final jsonResponse = json.decode(utf8.decode(response.bodyBytes));
         final data = QueryFolderData.fromJson(jsonResponse);
-
         data.folders.sort((a, b) => a.name.compareTo(b.name));
         data.files.sort((a, b) => a.name.compareTo(b.name));
-
         setState(() {
           currentPath = data.self.path;
           parentFolderID = data.self.parentFolderId;
           currentFolderID = data.self.id;
           folders = data.folders;
           files = data.files;
-          _loading = false; // 设置加载状态为 false
+          _loading = false;
         });
       } else {
-        // 处理错误响应
         throw Exception('Failed to load data: ${response.statusCode}');
       }
     } catch (e) {
-      // 捕获异常并处理
       print('请求过程中发生错误: $e');
-      setState(() {
-        _loading = false; // 确保加载状态被重置
-      });
+      if (mounted) setState(() { _loading = false; });
     }
   }
 
+  // ── 重命名 ────────────────────────────────
+
+  /// 弹出重命名对话框，预填当前名称，确认后调用 renameItem
   Future<void> showRenameDialog(BuildContext context, String name, int id, bool isFolder) {
-    final TextEditingController textController = TextEditingController(text: name);
+    final textController = TextEditingController(text: name);
+    // 在 await 前保存 messenger，避免 async gap 后 context 失效
+    final messenger = ScaffoldMessenger.of(context);
 
     return showDialog<void>(
       context: context,
-      barrierDismissible: false, // 用户点击背景时不会关闭对话框
-      builder: (BuildContext context) {
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
         return AlertDialog(
-          title: const Text('Rename'),
+          title: const Text('重命名'),
           content: TextField(
             controller: textController,
-            decoration: const InputDecoration(hintText: "Enter new name"),
+            decoration: const InputDecoration(hintText: '输入新名称'),
           ),
           actions: <Widget>[
             TextButton(
-              child: const Text('Cancel'),
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
+              child: const Text('取消'),
+              onPressed: () => Navigator.of(dialogContext).pop(),
             ),
             TextButton(
-              child: const Text('Rename'),
+              child: const Text('确认'),
               onPressed: () async {
                 if (textController.text.isNotEmpty) {
-                  await renameItem(context, textController.text, id, isFolder);
-                  Navigator.of(context).pop(); // 关闭对话框
+                  await renameItem(messenger, textController.text, id, isFolder);
+                  if (dialogContext.mounted) Navigator.of(dialogContext).pop();
                 }
               },
             ),
@@ -308,13 +346,15 @@ class BrowsePageState extends State<BrowsePage> {
     );
   }
 
-  Future<void> renameItem(BuildContext context, String newName, int id, bool isFolder) async {
+  /// 调用重命名接口，成功后用 copyWith 本地更新列表，无需重新拉取整个目录
+  Future<void> renameItem(ScaffoldMessengerState messenger, String newName, int id, bool isFolder) async {
     try {
       final url = isFolder
-          ? Uri.parse('http://182.92.66.72:8080/api/renameFolder')
-          : Uri.parse('http://182.92.66.72:8080/api/renameFile');
-
-      final body = isFolder ? {'folderName': newName, 'folderID': id} : {'fileName': newName, 'fileID': id};
+          ? Uri.parse('$_baseUrl/api/renameFolder')
+          : Uri.parse('$_baseUrl/api/renameFile');
+      final body = isFolder
+          ? {'folderName': newName, 'folderID': id}
+          : {'fileName': newName, 'fileID': id};
 
       final response = await http.post(
         url,
@@ -324,61 +364,48 @@ class BrowsePageState extends State<BrowsePage> {
 
       if (response.statusCode == 200) {
         if (isFolder) {
-          final folderIndex = folders?.indexWhere((folder) => folder.id == id);
-          if (folderIndex != null && folderIndex >= 0) {
-            setState(() {
-              folders![folderIndex] = folders![folderIndex].copyWith(name: newName);
-            });
+          final idx = folders?.indexWhere((f) => f.id == id);
+          if (idx != null && idx >= 0 && mounted) {
+            setState(() { folders![idx] = folders![idx].copyWith(name: newName); });
           }
         } else {
-          final fileIndex = files?.indexWhere((file) => file.id == id);
-          if (fileIndex != null && fileIndex >= 0) {
-            setState(() {
-              files![fileIndex] = files![fileIndex].copyWith(name: newName);
-            });
+          final idx = files?.indexWhere((f) => f.id == id);
+          if (idx != null && idx >= 0 && mounted) {
+            setState(() { files![idx] = files![idx].copyWith(name: newName); });
           }
         }
-
-        // 成功处理后的逻辑，例如刷新列表
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Renamed successfully!')),
-        );
-        // 更新UI代码...
+        messenger.showSnackBar(const SnackBar(content: Text('重命名成功')));
       } else {
-        // 错误处理
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to rename. Please try again.')),
-        );
+        messenger.showSnackBar(const SnackBar(content: Text('重命名失败，请重试')));
       }
     } catch (e) {
-      // 网络错误或其他异常处理
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('An error occurred. Please check your connection and try again.')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('网络错误，请检查连接')));
     }
   }
 
+  // ── 删除 ──────────────────────────────────
 
-  Future<void> showDeleteConfirmationDialog(BuildContext context, int id, bool isFolder) async {
+  /// 弹出删除确认对话框，防止误操作
+  Future<void> showDeleteConfirmationDialog(BuildContext context, int id, bool isFolder) {
+    final messenger = ScaffoldMessenger.of(context);
+
     return showDialog<void>(
       context: context,
-      barrierDismissible: false, // 用户点击背景时不会关闭对话框
-      builder: (BuildContext context) {
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
         return AlertDialog(
-          title: Text('Confirm Delete'),
-          content: Text(isFolder ? 'Are you sure you want to delete this folder?' : 'Are you sure you want to delete this file?'),
+          title: const Text('确认删除'),
+          content: Text(isFolder ? '确定要删除该文件夹吗？' : '确定要删除该文件吗？'),
           actions: <Widget>[
             TextButton(
-              child: Text('Cancel'),
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
+              child: const Text('取消'),
+              onPressed: () => Navigator.of(dialogContext).pop(),
             ),
             TextButton(
-              child: Text('Delete'),
+              child: const Text('删除'),
               onPressed: () async {
-                await deleteItem(context, id, isFolder);
-                Navigator.of(context).pop(); // 关闭对话框
+                await deleteItem(messenger, id, isFolder);
+                if (dialogContext.mounted) Navigator.of(dialogContext).pop();
               },
             ),
           ],
@@ -387,12 +414,12 @@ class BrowsePageState extends State<BrowsePage> {
     );
   }
 
-  Future<void> deleteItem(BuildContext context, int id, bool isFolder) async {
+  /// 调用删除接口，成功后从本地列表移除
+  Future<void> deleteItem(ScaffoldMessengerState messenger, int id, bool isFolder) async {
     try {
       final url = isFolder
-          ? Uri.parse('http://182.92.66.72:8080/api/deleteFolder')
-          : Uri.parse('http://182.92.66.72:8080/api/deleteFile');
-
+          ? Uri.parse('$_baseUrl/api/deleteFolder')
+          : Uri.parse('$_baseUrl/api/deleteFile');
       final body = isFolder ? {'folderID': id} : {'fileID': id};
 
       final response = await http.post(
@@ -401,70 +428,61 @@ class BrowsePageState extends State<BrowsePage> {
         body: jsonEncode(body),
       );
 
-      if (response.statusCode == 200) { // 通常204表示成功但没有内容返回
-        // 更新本地数据模型
-        if (isFolder) {
+      if (response.statusCode == 200) {
+        if (mounted) {
           setState(() {
-            folders?.removeWhere((folder) => folder.id == id);
-          });
-        } else {
-          setState(() {
-            files?.removeWhere((file) => file.id == id);
+            if (isFolder) {
+              folders?.removeWhere((f) => f.id == id);
+            } else {
+              files?.removeWhere((f) => f.id == id);
+            }
           });
         }
-
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Deleted successfully!')),
-        );
+        messenger.showSnackBar(const SnackBar(content: Text('删除成功')));
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to delete. Please try again.')),
-        );
+        messenger.showSnackBar(const SnackBar(content: Text('删除失败，请重试')));
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('An error occurred. Please check your connection and try again.')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('网络错误，请检查连接')));
     }
   }
 
+  // ── 新建文件夹 ────────────────────────────
+
+  /// 弹出输入框让用户填写新文件夹名称，确认后调用 createFolder
   void showCreateFolderDialog(BuildContext context, int parentFolderID) {
-    final TextEditingController _controller = TextEditingController();
+    final controller = TextEditingController();
+    final messenger = ScaffoldMessenger.of(context);
 
     showDialog(
       context: context,
-      builder: (BuildContext context) {
+      builder: (BuildContext dialogContext) {
         return AlertDialog(
-          title: const Text('Create New Folder'),
+          title: const Text('新建文件夹'),
           content: TextField(
-            controller: _controller,
-            decoration: const InputDecoration(hintText: 'Enter folder name'),
+            controller: controller,
+            decoration: const InputDecoration(hintText: '输入文件夹名称'),
           ),
           actions: <Widget>[
             TextButton(
-              child: const Text('Cancel'),
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
+              child: const Text('取消'),
+              onPressed: () => Navigator.of(dialogContext).pop(),
             ),
             TextButton(
-              child: const Text('Create'),
+              child: const Text('创建'),
               onPressed: () async {
-                final String folderName = _controller.text.trim();
+                final folderName = controller.text.trim();
                 if (folderName.isNotEmpty) {
-                  final newFolder = await createFolder(folderName, parentFolderID);
-                  if (newFolder != null) {
+                  final newFolder = await createFolder(messenger, folderName, parentFolderID);
+                  if (newFolder != null && mounted) {
                     setState(() {
                       folders?.add(newFolder);
                       folders?.sort((a, b) => a.name.compareTo(b.name));
                     });
                   }
-
-                  Navigator.of(context).pop(); // 关闭对话框
+                  if (dialogContext.mounted) Navigator.of(dialogContext).pop();
                 } else {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Folder name cannot be empty')),
-                  );
+                  messenger.showSnackBar(const SnackBar(content: Text('文件夹名称不能为空')));
                 }
               },
             ),
@@ -474,149 +492,152 @@ class BrowsePageState extends State<BrowsePage> {
     );
   }
 
-  Future<Folder?> createFolder(String folderName, int parentFolderID) async {
-    final url = Uri.parse('http://182.92.66.72:8080/api/createFolder');
-    final response = await http.post(
-      url,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        "folderName": folderName,
-        "parentFolderID": parentFolderID,
-      }),
-    );
-
-    if (response.statusCode == 200) {
-      // 请求成功，可以刷新数据或显示成功消息
-      print('Folder created successfully');
-      final responseData = jsonDecode(response.body);
-      final newFolder = Folder.fromJson(responseData);
-      print('Folder created successfully: ${newFolder.name}');
-      return newFolder;
-    } else {
-      // 请求失败，打印错误信息
-      print('Failed to create folder: ${response.statusCode}');
-    }
-  }
-
-  void showUploadFileDialog(BuildContext context) async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles();
-
-    if (result != null) {
-      PlatformFile file = result.files.first;
-      final response = await uploadFile(file, currentFolderID);
-
-      if (response != null) {
-        // 更新本地状态和UI
-        setState(() {
-          files?.add(response);
-          // 对列表进行排序，这里以文件名称为例
-          files?.sort((a, b) => a.name.compareTo(b.name));
-        });
-      }
-    } else {
-      // 用户取消了文件选择
-    }
-  }
-
-  Future<File?> uploadFile(PlatformFile file, int parentFolderID) async {
+  /// 调用新建文件夹接口，返回后端创建好的 Folder 对象（含 ID）
+  Future<Folder?> createFolder(ScaffoldMessengerState messenger, String folderName, int parentFolderID) async {
     try {
-      var request = http.MultipartRequest(
-        'POST',
-        Uri.parse('http://182.92.66.72:8080/api/uploadFile'),
+      final response = await http.post(
+        Uri.parse('$_baseUrl/api/createFolder'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'folderName': folderName, 'parentFolderID': parentFolderID}),
       );
-
-      // 添加文件到请求中
-      request.files.add(await http.MultipartFile.fromPath(
-        'file', // 这是服务器端期待的字段名
-        file.path!,
-        contentType: MediaType.parse(lookupMimeType(file.path!) ?? 'application/octet-stream'),
-      ));
-
-      // 添加其他表单字段
-      request.fields['parentFolderID'] = parentFolderID.toString();
-      request.fields['fileSize'] = file.size.toString();
-
-      var streamedResponse = await request.send();
-      var response = await http.Response.fromStream(streamedResponse);
-
       if (response.statusCode == 200) {
-        final responseData = jsonDecode(response.body);
-        final uploadedFile = File.fromJson(responseData);
-        print('File uploaded successfully: ${uploadedFile.name}');
-        return uploadedFile;
+        final responseData = json.decode(utf8.decode(response.bodyBytes));
+        return Folder.fromJson(responseData);
       } else {
-        print('Failed to upload file: ${response.statusCode}');
-        // throw Exception('Failed to upload file');
+        messenger.showSnackBar(const SnackBar(content: Text('创建文件夹失败，请重试')));
+        return null;
       }
     } catch (e) {
-      print('Error during file upload: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to upload file: $e')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('网络错误，请检查连接')));
       return null;
     }
   }
 
-  Future<void> downloadFile(int fileID) async {
-    // 发送下载请求
-    final response = await http.post(
-      Uri.parse('http://182.92.66.72:8080/api/downloadFile'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({"fileID": fileID}),
-    );
+  // ── 上传文件 ──────────────────────────────
 
-    if (response.statusCode == 200) {
-      final downloadUrl = jsonDecode(response.body)['downloadUrl'];
-
-      // 获取保存路径
-      final directory = await getExternalStorageDirectory();
-      if (directory == null) {
-        throw Exception("Failed to get external storage directory.");
+  /// 调起系统文件选择器，用户选择文件后上传到当前目录
+  void showUploadFileDialog(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final result = await FilePicker.platform.pickFiles();
+    if (result != null) {
+      final file = result.files.first;
+      setState(() { _uploading = true; _uploadingName = file.name; });
+      final uploaded = await uploadFile(messenger, file, currentFolderID);
+      if (mounted) {
+        setState(() { _uploading = false; _uploadingName = ''; });
+        if (uploaded != null) {
+          setState(() {
+            files?.add(uploaded);
+            files?.sort((a, b) => a.name.compareTo(b.name));
+          });
+        }
       }
-
-      // 构建下载任务
-      final taskId = await FlutterDownloader.enqueue(
-        url: downloadUrl,
-        savedDir: directory.path,
-        fileName: "file_$fileID", // 可以根据实际情况调整文件名
-        showNotification: true, // 显示下载进度通知
-        openFileFromNotification: true, // 下载完成后打开文件
-      );
-
-      print('Download task created with ID: $taskId');
-    } else {
-      throw Exception('Failed to initiate download: ${response.statusCode}');
     }
   }
 
-  void showDownloadConfirmationDialog(BuildContext context, int fileID) {
+  /// 以 multipart/form-data 格式上传文件
+  Future<File?> uploadFile(ScaffoldMessengerState messenger, PlatformFile file, int parentFolderID) async {
+    try {
+      final request = http.MultipartRequest(
+        'POST',
+        Uri.parse('$_baseUrl/api/uploadFile'),
+      );
+      request.files.add(await http.MultipartFile.fromPath(
+        'file',
+        file.path!,
+        contentType: MediaType.parse(lookupMimeType(file.path!) ?? 'application/octet-stream'),
+      ));
+      request.fields['parentFolderID'] = parentFolderID.toString();
+      request.fields['fileSize'] = file.size.toString();
+
+      final streamedResponse = await request.send();
+      final response = await http.Response.fromStream(streamedResponse);
+
+      if (response.statusCode == 200) {
+        final responseData = json.decode(utf8.decode(response.bodyBytes));
+        return File.fromJson(responseData);
+      } else {
+        messenger.showSnackBar(const SnackBar(content: Text('上传失败，请重试')));
+        return null;
+      }
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('上传失败: $e')));
+      return null;
+    }
+  }
+
+  // ── 下载文件 ──────────────────────────────
+
+  /// 向后端 POST 请求，接收文件二进制流，保存到本地存储目录
+  Future<void> downloadFile(BuildContext context, int fileID, String fileName) async {
+    setState(() { _downloading = true; _downloadingName = fileName; });
+    // 在第一个 await 前保存 messenger，避免 async gap 后 context 失效
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final response = await http.post(
+        Uri.parse('$_baseUrl/api/downloadFile'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'fileID': fileID}),
+      );
+      if (response.statusCode == 200) {
+        final dir = await _getDownloadDirectory();
+        final file = io.File('${dir.path}/$fileName');
+        await file.writeAsBytes(response.bodyBytes);
+        messenger.showSnackBar(SnackBar(content: Text('已保存: ${file.path}')));
+      } else {
+        messenger.showSnackBar(const SnackBar(content: Text('下载失败，请重试')));
+      }
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('下载失败: $e')));
+    } finally {
+      if (mounted) setState(() { _downloading = false; _downloadingName = ''; });
+    }
+  }
+
+  /// 下载文件夹（ZIP 打包），进度通过顶部 banner 展示
+  Future<void> downloadFolder(BuildContext context, int folderID, String folderName) async {
+    setState(() { _downloading = true; _downloadingName = '$folderName.zip'; });
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final response = await http.post(
+        Uri.parse('$_baseUrl/api/downloadFolder'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'folderID': folderID}),
+      );
+      if (response.statusCode == 200) {
+        final dir = await _getDownloadDirectory();
+        final file = io.File('${dir.path}/$folderName.zip');
+        await file.writeAsBytes(response.bodyBytes);
+        messenger.showSnackBar(SnackBar(content: Text('已保存: ${file.path}')));
+      } else {
+        messenger.showSnackBar(const SnackBar(content: Text('下载失败，请重试')));
+      }
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('下载失败: $e')));
+    } finally {
+      if (mounted) setState(() { _downloading = false; _downloadingName = ''; });
+    }
+  }
+
+  /// 下载前弹出确认对话框（文件下载是触发性操作，确认防止误触）
+  void showDownloadConfirmationDialog(BuildContext context, int fileID, String fileName) {
     showDialog(
       context: context,
-      builder: (BuildContext context) {
+      builder: (BuildContext dialogContext) {
         return AlertDialog(
-          title: const Text('Download File'),
-          content: const Text('Do you want to download this file?'),
+          title: const Text('下载文件'),
+          content: Text('确认下载「$fileName」？'),
           actions: <Widget>[
             TextButton(
-              child: const Text('Cancel'),
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
+              child: const Text('取消'),
+              onPressed: () => Navigator.of(dialogContext).pop(),
             ),
             TextButton(
-              child: const Text('Download'),
-              onPressed: () async {
-                try {
-                  await downloadFile(fileID);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Download started.')),
-                  );
-                } catch (e) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Failed to start download: $e')),
-                  );
-                }
-                Navigator.of(context).pop();
+              child: const Text('下载'),
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                // 使用外层 context（页面级别），而非 dialog 的 context
+                downloadFile(context, fileID, fileName);
               },
             ),
           ],
@@ -625,13 +646,42 @@ class BrowsePageState extends State<BrowsePage> {
     );
   }
 
-  void onTap(BuildContext context, int id, bool isFolder) {
+  // ── 列表点击 ──────────────────────────────
+
+  /// 文件夹 → 进入该目录；文件 → 弹出下载确认框
+  void onTap(BuildContext context, dynamic item, bool isFolder) {
     if (isFolder) {
-      _fetchData(id);
+      _fetchData((item as Folder).id);
+    } else {
+      final file = item as File;
+      showDownloadConfirmationDialog(context, file.id, file.name);
     }
-    else {
-      showDownloadConfirmationDialog(context, id);
-    }
+  }
+
+  // ── UI 构建 ───────────────────────────────
+
+  Widget _buildProgressBanner(String message) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      color: Colors.blue[50],
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(fontSize: 13, color: Colors.blueGrey),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -640,87 +690,102 @@ class BrowsePageState extends State<BrowsePage> {
       appBar: AppBar(
         title: Row(
           children: [
-            // 返回上一层按钮，条件渲染
             if (parentFolderID != 0)
               IconButton(
-                icon: Icon(Icons.arrow_back),
-                onPressed: () async {
-                  // 处理返回上一层逻辑
-                  await _fetchData(parentFolderID);
-                },
+                icon: const Icon(Icons.arrow_back),
+                onPressed: () => _fetchData(parentFolderID),
               ),
-            // 显示当前路径
             Expanded(
               child: Text(
-                'Current Path: $currentPath',
+                currentPath ?? '',
                 overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 20),
+                style: const TextStyle(fontSize: 20),
               ),
             ),
           ],
         ),
       ),
       body: RefreshIndicator(
-        onRefresh: () async {
-          await _fetchData(currentFolderID);
-        },
+        onRefresh: () => _fetchData(currentFolderID),
         child: _loading
           ? const Center(child: CircularProgressIndicator())
           : Column(
-        children: [
-          Expanded(
-            child: ListView.builder(
-              itemCount: (folders?.length ?? 0) + (files?.length ?? 0),
-              itemBuilder: (context, index) {
-                final isFolder = index < (folders?.length ?? 0);
-                final item = isFolder ? folders![index] : files![index - (folders?.length ?? 0)];
+              children: [
+                if (_uploading)
+                  _buildProgressBanner('正在上传: $_uploadingName'),
+                if (_downloading)
+                  _buildProgressBanner('正在下载: $_downloadingName'),
+                Expanded(
+                  child: ListView.builder(
+                    // 文件夹在前，文件在后，合并为一个列表
+                    itemCount: (folders?.length ?? 0) + (files?.length ?? 0),
+                    itemBuilder: (context, index) {
+                      final isFolder = index < (folders?.length ?? 0);
+                      final item = isFolder
+                          ? folders![index]
+                          : files![index - (folders?.length ?? 0)];
+                      final itemId = item is Folder ? item.id : (item as File).id;
+                      final itemName = item is Folder ? item.name : (item as File).name;
 
-                return Slidable(
-                  key: ValueKey(item is Folder ? item.id : (item as File).id),
-                  endActionPane: ActionPane(
-                    motion: const ScrollMotion(),
-                    children: [
-                      SlidableAction(
-                        onPressed: (context) => showRenameDialog(context, item is Folder ? item.name : (item as File).name, item is Folder ? item.id : (item as File).id, isFolder),
-                        backgroundColor: Colors.blue,
-                        foregroundColor: Colors.white,
-                        icon: Icons.edit,
-                        label: 'Rename',
-                      ),
-                      SlidableAction(
-                        onPressed: (context) => showDeleteConfirmationDialog(context, item is Folder ? item.id : (item as File).id, isFolder),
-                        backgroundColor: Colors.red,
-                        foregroundColor: Colors.white,
-                        icon: Icons.delete,
-                        label: 'Delete',
+                      return Slidable(
+                        key: ValueKey(itemId),
+                        endActionPane: ActionPane(
+                          motion: const ScrollMotion(),
+                          children: [
+                            // 下载：文件夹打包 ZIP，文件弹确认框
+                            SlidableAction(
+                              onPressed: (_) => isFolder
+                                  ? downloadFolder(context, itemId, itemName)
+                                  : showDownloadConfirmationDialog(context, itemId, itemName),
+                              backgroundColor: Colors.green,
+                              foregroundColor: Colors.white,
+                              icon: Icons.download,
+                              label: '下载',
+                            ),
+                            SlidableAction(
+                              onPressed: (_) => showRenameDialog(context, itemName, itemId, isFolder),
+                              backgroundColor: Colors.blue,
+                              foregroundColor: Colors.white,
+                              icon: Icons.edit,
+                              label: '重命名',
+                            ),
+                            SlidableAction(
+                              onPressed: (_) => showDeleteConfirmationDialog(context, itemId, isFolder),
+                              backgroundColor: Colors.red,
+                              foregroundColor: Colors.white,
+                              icon: Icons.delete,
+                              label: '删除',
+                            ),
+                          ],
                         ),
-                    ],
+                        child: ListTile(
+                          leading: isFolder
+                              ? const Icon(Icons.folder)
+                              : const Icon(Icons.insert_drive_file),
+                          title: Text(itemName),
+                          subtitle: isFolder ? null : Text(_formatFileSize((item as File).size)),
+                          onTap: () => onTap(context, item, isFolder),
+                        ),
+                      );
+                    },
                   ),
-                  child: ListTile(
-                    leading: isFolder ? const Icon(Icons.folder) : const Icon(Icons.insert_drive_file),
-                    title: Text(item is Folder ? item.name : (item as File).name),
-                    subtitle: isFolder ? null : Text('${(item as File).size} bytes'),
-                    onTap: () => onTap(context, item is Folder ? (item as Folder).id : (item as File).id, isFolder),
-                  ),
-                );
-              },
+                ),
+              ],
             ),
-          ),
-        ],
       ),
-    ),
+      // 右下角两个浮动按钮：新建文件夹 / 上传文件
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
         children: <Widget>[
           FloatingActionButton(
             onPressed: () => showCreateFolderDialog(context, currentFolderID),
-            tooltip: 'Add Folder',
+            tooltip: '新建文件夹',
             child: const Icon(Icons.create_new_folder),
           ),
-          const SizedBox(height: 10), // 添加一些间距
+          const SizedBox(height: 10),
           FloatingActionButton(
             onPressed: () => showUploadFileDialog(context),
-            tooltip: 'Upload File',
+            tooltip: '上传文件',
             child: const Icon(Icons.file_upload),
           ),
         ],
