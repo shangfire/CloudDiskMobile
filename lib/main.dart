@@ -247,7 +247,7 @@ class BrowsePageState extends State<BrowsePage> {
   bool _downloading = false;    // 下载进行中（文件或文件夹）
   String _downloadingName = ''; // 正在下载的文件/文件夹名称
 
-  static const String _baseUrl = 'http://182.92.66.72:8080';
+  static const String _baseUrl = 'https://shangfire.cn';
 
   @override
   void initState() {

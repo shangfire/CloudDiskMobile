@@ -25,3 +25,11 @@ doc/api/
 
 .flutter-plugins
 .flutter-plugins-dependencies
+
+# CocoaPods
+ios/Pods/
+macos/Pods/
+
+# Xcode user data
+*.xcuserstate
+xcuserdata/
