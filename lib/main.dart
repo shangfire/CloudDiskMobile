@@ -8,6 +8,7 @@ import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
@@ -244,8 +245,9 @@ class BrowsePageState extends State<BrowsePage> {
   bool _loading = true;
   bool _uploading = false;      // 上传进行中
   String _uploadingName = '';   // 正在上传的文件名
-  bool _downloading = false;    // 下载进行中（文件或文件夹）
-  String _downloadingName = ''; // 正在下载的文件/文件夹名称
+  bool _downloading = false;
+  String _downloadingName = '';
+  double _downloadProgress = 0.0; // 0.0~1.0，-1 表示进度未知
 
   static const String _baseUrl = 'https://shangfire.cn';
 
@@ -535,6 +537,148 @@ class BrowsePageState extends State<BrowsePage> {
     }
   }
 
+  void showUploadFolderDialog(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final dirPath = await FilePicker.platform.getDirectoryPath();
+    if (dirPath == null || !mounted) return;
+
+    final dir = io.Directory(dirPath);
+    final folderName = dirPath.split(io.Platform.pathSeparator).last;
+
+    // 构建预览列表（含根目录节点）
+    final flatList = <Map<String, dynamic>>[];
+    flatList.add({'name': folderName, 'isFolder': true, 'depth': 0});
+    await _buildPreviewList(dir, 1, flatList);
+
+    final folderCount = flatList.where((e) => e['isFolder'] == true).length;
+    final fileCount   = flatList.where((e) => e['isFolder'] == false).length;
+
+    if (!mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: this.context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('准备上传'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('$folderCount 个文件夹，$fileCount 个文件',
+                style: const TextStyle(fontSize: 13, color: Colors.grey)),
+            const SizedBox(height: 8),
+            Container(
+              constraints: const BoxConstraints(maxHeight: 300),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey.shade300),
+                borderRadius: BorderRadius.circular(4),
+                color: Colors.grey[50],
+              ),
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: flatList.length,
+                itemBuilder: (_, i) {
+                  final item = flatList[i];
+                  final depth = item['depth'] as int;
+                  final isFolder = item['isFolder'] as bool;
+                  return Padding(
+                    padding: EdgeInsets.only(left: depth * 16.0 + 8, top: 3, bottom: 3, right: 8),
+                    child: Row(
+                      children: [
+                        Icon(isFolder ? Icons.folder : Icons.insert_drive_file,
+                            size: 15, color: isFolder ? Colors.amber : Colors.blueGrey),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(item['name'] as String,
+                              style: const TextStyle(fontSize: 13),
+                              overflow: TextOverflow.ellipsis),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dialogContext).pop(false), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.of(dialogContext).pop(true), child: const Text('确认上传')),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() { _uploading = true; _uploadingName = folderName; });
+    try {
+      // 先在当前目录创建根文件夹，再递归上传内容
+      final rootFolder = await createFolder(messenger, folderName, currentFolderID);
+      if (rootFolder != null) {
+        await _uploadDirectoryContents(messenger, dir, rootFolder.id);
+      }
+      if (mounted) await _fetchData(currentFolderID);
+    } finally {
+      if (mounted) setState(() { _uploading = false; _uploadingName = ''; });
+    }
+  }
+
+  Future<void> _buildPreviewList(io.Directory dir, int depth, List<Map<String, dynamic>> result) async {
+    final entities = await dir.list().toList();
+    entities.sort((a, b) {
+      final aIsDir = a is io.Directory;
+      final bIsDir = b is io.Directory;
+      if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
+      return a.path.compareTo(b.path);
+    });
+    for (final entity in entities) {
+      final name = entity.path.split(io.Platform.pathSeparator).last;
+      final isFolder = entity is io.Directory;
+      result.add({'name': name, 'isFolder': isFolder, 'depth': depth});
+      if (entity is io.Directory) {
+        await _buildPreviewList(entity, depth + 1, result);
+      }
+    }
+  }
+
+  Future<void> _uploadDirectoryContents(
+      ScaffoldMessengerState messenger, io.Directory dir, int parentFolderID) async {
+    final entities = await dir.list().toList();
+    for (final entity in entities) {
+      if (entity is io.Directory) {
+        final name = entity.path.split(io.Platform.pathSeparator).last;
+        if (mounted) setState(() { _uploadingName = name; });
+        final newFolder = await createFolder(messenger, name, parentFolderID);
+        if (newFolder != null) {
+          await _uploadDirectoryContents(messenger, entity, newFolder.id);
+        }
+      }
+    }
+    for (final entity in entities) {
+      if (entity is io.File) {
+        final name = entity.path.split(io.Platform.pathSeparator).last;
+        if (mounted) setState(() { _uploadingName = name; });
+        await _uploadFileFromPath(messenger, entity.path, name, parentFolderID);
+      }
+    }
+  }
+
+  Future<void> _uploadFileFromPath(
+      ScaffoldMessengerState messenger, String filePath, String fileName, int parentFolderID) async {
+    try {
+      final fileSize = await io.File(filePath).length();
+      final request = http.MultipartRequest('POST', Uri.parse('$_baseUrl/api/uploadFile'));
+      request.files.add(await http.MultipartFile.fromPath(
+        'file', filePath,
+        contentType: MediaType.parse(lookupMimeType(filePath) ?? 'application/octet-stream'),
+      ));
+      request.fields['parentFolderID'] = parentFolderID.toString();
+      request.fields['fileSize'] = fileSize.toString();
+      final streamedResponse = await request.send();
+      await http.Response.fromStream(streamedResponse);
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('上传失败: $fileName - $e')));
+    }
+  }
+
   /// 以 multipart/form-data 格式上传文件
   Future<File?> uploadFile(ScaffoldMessengerState messenger, PlatformFile file, int parentFolderID) async {
     try {
@@ -568,21 +712,26 @@ class BrowsePageState extends State<BrowsePage> {
 
   // ── 下载文件 ──────────────────────────────
 
-  /// 向后端 POST 请求，接收文件二进制流，保存到本地存储目录
   Future<void> downloadFile(BuildContext context, int fileID, String fileName) async {
-    setState(() { _downloading = true; _downloadingName = fileName; });
-    // 在第一个 await 前保存 messenger，避免 async gap 后 context 失效
+    setState(() { _downloading = true; _downloadingName = fileName; _downloadProgress = 0.0; });
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final response = await http.post(
-        Uri.parse('$_baseUrl/api/downloadFile'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'fileID': fileID}),
-      );
-      if (response.statusCode == 200) {
+      final request = http.Request('GET', Uri.parse('$_baseUrl/api/downloadFile?fileID=$fileID'));
+      final streamedResponse = await http.Client().send(request);
+      if (streamedResponse.statusCode == 200) {
+        final contentLength = streamedResponse.contentLength;
         final dir = await _getDownloadDirectory();
         final file = io.File('${dir.path}/$fileName');
-        await file.writeAsBytes(response.bodyBytes);
+        final sink = file.openWrite();
+        int received = 0;
+        await for (final chunk in streamedResponse.stream) {
+          sink.add(chunk);
+          received += chunk.length;
+          if (contentLength != null && contentLength > 0 && mounted) {
+            setState(() { _downloadProgress = received / contentLength; });
+          }
+        }
+        await sink.close();
         messenger.showSnackBar(SnackBar(content: Text('已保存: ${file.path}')));
       } else {
         messenger.showSnackBar(const SnackBar(content: Text('下载失败，请重试')));
@@ -590,7 +739,7 @@ class BrowsePageState extends State<BrowsePage> {
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('下载失败: $e')));
     } finally {
-      if (mounted) setState(() { _downloading = false; _downloadingName = ''; });
+      if (mounted) setState(() { _downloading = false; _downloadingName = ''; _downloadProgress = 0.0; });
     }
   }
 
@@ -599,10 +748,8 @@ class BrowsePageState extends State<BrowsePage> {
     setState(() { _downloading = true; _downloadingName = '$folderName.zip'; });
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final response = await http.post(
-        Uri.parse('$_baseUrl/api/downloadFolder'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'folderID': folderID}),
+      final response = await http.get(
+        Uri.parse('$_baseUrl/api/downloadFolder?folderID=$folderID'),
       );
       if (response.statusCode == 200) {
         final dir = await _getDownloadDirectory();
@@ -646,6 +793,69 @@ class BrowsePageState extends State<BrowsePage> {
     );
   }
 
+  // ── 粘贴文本 ──────────────────────────────
+
+  void showPasteTextDialog(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text?.trim() ?? '';
+    if (!mounted) return;
+    if (text.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('剪贴板中没有文本内容')));
+      return;
+    }
+    final now = DateTime.now();
+    String pad(int n) => n.toString().padLeft(2, '0');
+    final defaultName =
+        '${now.year}-${pad(now.month)}-${pad(now.day)}_${pad(now.hour)}-${pad(now.minute)}-${pad(now.second)}.txt';
+    final controller = TextEditingController(text: defaultName);
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('粘贴文本'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('文件名', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 4),
+            TextField(controller: controller, decoration: const InputDecoration(isDense: true)),
+            const SizedBox(height: 12),
+            const Text('内容预览', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 4),
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: Colors.grey[100], borderRadius: BorderRadius.circular(4)),
+              constraints: const BoxConstraints(maxHeight: 120),
+              child: SingleChildScrollView(
+                child: Text(
+                  text.length > 300 ? '${text.substring(0, 300)}...' : text,
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dialogContext).pop(), child: const Text('取消')),
+          TextButton(
+            onPressed: () async {
+              Navigator.of(dialogContext).pop();
+              final filename = controller.text.trim().isEmpty ? defaultName : controller.text.trim();
+              final tempFile = io.File('${io.Directory.systemTemp.path}/$filename');
+              await tempFile.writeAsString(text);
+              await _uploadFileFromPath(messenger, tempFile.path, filename, currentFolderID);
+              await tempFile.delete();
+              if (mounted) await _fetchData(currentFolderID);
+            },
+            child: const Text('确定上传'),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── 列表点击 ──────────────────────────────
 
   /// 文件夹 → 进入该目录；文件 → 弹出下载确认框
@@ -660,25 +870,40 @@ class BrowsePageState extends State<BrowsePage> {
 
   // ── UI 构建 ───────────────────────────────
 
-  Widget _buildProgressBanner(String message) {
+  Widget _buildProgressBanner(String message, {double? progress}) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       color: Colors.blue[50],
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const SizedBox(
-            width: 14,
-            height: 14,
-            child: CircularProgressIndicator(strokeWidth: 2),
+          Row(
+            children: [
+              SizedBox(
+                width: 14, height: 14,
+                child: progress != null
+                    ? CircularProgressIndicator(value: progress, strokeWidth: 2)
+                    : const CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  message,
+                  style: const TextStyle(fontSize: 13, color: Colors.blueGrey),
+                ),
+              ),
+              if (progress != null)
+                Text(
+                  '${(progress * 100).toStringAsFixed(0)}%',
+                  style: const TextStyle(fontSize: 13, color: Colors.blueGrey),
+                ),
+            ],
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              message,
-              style: const TextStyle(fontSize: 13, color: Colors.blueGrey),
-            ),
-          ),
+          if (progress != null) ...[
+            const SizedBox(height: 4),
+            LinearProgressIndicator(value: progress),
+          ],
         ],
       ),
     );
@@ -704,6 +929,13 @@ class BrowsePageState extends State<BrowsePage> {
             ),
           ],
         ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.content_paste),
+            tooltip: '粘贴文本',
+            onPressed: () => showPasteTextDialog(context),
+          ),
+        ],
       ),
       body: RefreshIndicator(
         onRefresh: () => _fetchData(currentFolderID),
@@ -714,7 +946,10 @@ class BrowsePageState extends State<BrowsePage> {
                 if (_uploading)
                   _buildProgressBanner('正在上传: $_uploadingName'),
                 if (_downloading)
-                  _buildProgressBanner('正在下载: $_downloadingName'),
+                  _buildProgressBanner(
+                    '正在下载: $_downloadingName',
+                    progress: _downloadProgress > 0 ? _downloadProgress : null,
+                  ),
                 Expanded(
                   child: ListView.builder(
                     // 文件夹在前，文件在后，合并为一个列表
@@ -773,7 +1008,7 @@ class BrowsePageState extends State<BrowsePage> {
               ],
             ),
       ),
-      // 右下角两个浮动按钮：新建文件夹 / 上传文件
+      // 右下角三个浮动按钮：新建文件夹 / 上传文件夹 / 上传文件
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
         children: <Widget>[
@@ -781,6 +1016,12 @@ class BrowsePageState extends State<BrowsePage> {
             onPressed: () => showCreateFolderDialog(context, currentFolderID),
             tooltip: '新建文件夹',
             child: const Icon(Icons.create_new_folder),
+          ),
+          const SizedBox(height: 10),
+          FloatingActionButton(
+            onPressed: () => showUploadFolderDialog(context),
+            tooltip: '上传文件夹',
+            child: const Icon(Icons.drive_folder_upload),
           ),
           const SizedBox(height: 10),
           FloatingActionButton(
